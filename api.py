@@ -23,8 +23,7 @@ logger = logging.getLogger(__name__)
 
 CLIENT_SECRETS_FILE = os.getenv("GOOGLE_CLIENT_SECRETS_FILE", "client_secret.json")
 
-# Simple in-memory token storage.
-# Fine for first pass, not production-grade persistence.
+# Simple in-memory token storage
 stored_token: Optional[dict] = None
 
 
@@ -33,10 +32,6 @@ def _redirect_uri(request: Request) -> str:
 
 
 def _validate_client_secrets_file() -> None:
-    """
-    Fail early with a clear error if the client secrets file is missing
-    or invalid JSON.
-    """
     path = Path(CLIENT_SECRETS_FILE)
 
     if not path.exists():
@@ -59,20 +54,17 @@ def _validate_client_secrets_file() -> None:
 
 
 def build_flow(request: Request, state: Optional[str] = None) -> Flow:
-    """
-    Build the OAuth flow. On callback, pass the original state back in.
-    """
     _validate_client_secrets_file()
 
     try:
-        return Flow.from_client_secrets_file(
+        flow = Flow.from_client_secrets_file(
             CLIENT_SECRETS_FILE,
             scopes=SCOPES,
             state=state,
             redirect_uri=_redirect_uri(request),
         )
+        return flow
     except ValueError as e:
-        # Usually means the file exists but isn't in valid Google client config format.
         raise HTTPException(
             status_code=500,
             detail=f"Invalid Google OAuth client configuration: {str(e)}"
@@ -114,10 +106,12 @@ def login(request: Request):
         prompt="consent",
     )
 
+    code_verifier = flow.code_verifier
+    if not code_verifier:
+        raise HTTPException(status_code=500, detail="Missing code verifier during login.")
+
     response = RedirectResponse(url=authorization_url)
 
-    # On Render HTTPS, secure cookies are appropriate.
-    # For local HTTP testing, set to False or make it environment-driven.
     cookie_secure = request.url.scheme == "https"
 
     response.set_cookie(
@@ -126,7 +120,16 @@ def login(request: Request):
         httponly=True,
         secure=cookie_secure,
         samesite="lax",
-        max_age=600,  # 10 minutes
+        max_age=600,
+        path="/",
+    )
+    response.set_cookie(
+        key="oauth_code_verifier",
+        value=code_verifier,
+        httponly=True,
+        secure=cookie_secure,
+        samesite="lax",
+        max_age=600,
         path="/",
     )
     return response
@@ -140,7 +143,12 @@ def auth_callback(request: Request):
     if not state:
         raise HTTPException(status_code=400, detail="Missing OAuth state cookie.")
 
+    code_verifier = request.cookies.get("oauth_code_verifier")
+    if not code_verifier:
+        raise HTTPException(status_code=400, detail="Missing OAuth code verifier cookie.")
+
     flow = build_flow(request, state=state)
+    flow.code_verifier = code_verifier
 
     try:
         flow.fetch_token(authorization_response=str(request.url))
@@ -166,6 +174,7 @@ def auth_callback(request: Request):
         "message": "Google login complete. You can now call /read-current"
     })
     response.delete_cookie(key="oauth_state", path="/")
+    response.delete_cookie(key="oauth_code_verifier", path="/")
     return response
 
 
