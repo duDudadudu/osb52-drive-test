@@ -1,5 +1,11 @@
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Optional
+
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 
@@ -13,26 +19,67 @@ from main import (
 )
 
 app = FastAPI(title="OSB Drive Reader API")
+logger = logging.getLogger(__name__)
 
-CLIENT_SECRETS_FILE = "client_secret.json"
+CLIENT_SECRETS_FILE = os.getenv("GOOGLE_CLIENT_SECRETS_FILE", "client_secret.json")
 
-# Simple test storage: one token in memory
-# Good enough for first pass, not production-grade
-stored_token = None
-
-
-def build_flow(request: Request):
-    redirect_uri = str(request.url_for("auth_callback"))
-
-    flow = Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE,
-        scopes=SCOPES,
-        redirect_uri=redirect_uri,
-    )
-    return flow
+# Simple in-memory token storage.
+# Fine for first pass, not production-grade persistence.
+stored_token: Optional[dict] = None
 
 
-def build_creds_from_stored_token():
+def _redirect_uri(request: Request) -> str:
+    return str(request.url_for("auth_callback"))
+
+
+def _validate_client_secrets_file() -> None:
+    """
+    Fail early with a clear error if the client secrets file is missing
+    or invalid JSON.
+    """
+    path = Path(CLIENT_SECRETS_FILE)
+
+    if not path.exists():
+        raise HTTPException(
+            status_code=500,
+            detail=f"OAuth client secrets file not found: {CLIENT_SECRETS_FILE}"
+        )
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            json.load(f)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"OAuth client secrets file is invalid JSON: "
+                f"{CLIENT_SECRETS_FILE} (line {e.lineno}, column {e.colno})"
+            )
+        ) from e
+
+
+def build_flow(request: Request, state: Optional[str] = None) -> Flow:
+    """
+    Build the OAuth flow. On callback, pass the original state back in.
+    """
+    _validate_client_secrets_file()
+
+    try:
+        return Flow.from_client_secrets_file(
+            CLIENT_SECRETS_FILE,
+            scopes=SCOPES,
+            state=state,
+            redirect_uri=_redirect_uri(request),
+        )
+    except ValueError as e:
+        # Usually means the file exists but isn't in valid Google client config format.
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid Google OAuth client configuration: {str(e)}"
+        ) from e
+
+
+def build_creds_from_stored_token() -> Optional[Credentials]:
     global stored_token
 
     if not stored_token:
@@ -52,7 +99,8 @@ def build_creds_from_stored_token():
 def home():
     return {
         "status": "ok",
-        "message": "OSB Drive Reader API is running"
+        "message": "OSB Drive Reader API is running",
+        "client_secrets_file": CLIENT_SECRETS_FILE,
     }
 
 
@@ -67,7 +115,20 @@ def login(request: Request):
     )
 
     response = RedirectResponse(url=authorization_url)
-    response.set_cookie("oauth_state", state, httponly=True)
+
+    # On Render HTTPS, secure cookies are appropriate.
+    # For local HTTP testing, set to False or make it environment-driven.
+    cookie_secure = request.url.scheme == "https"
+
+    response.set_cookie(
+        key="oauth_state",
+        value=state,
+        httponly=True,
+        secure=cookie_secure,
+        samesite="lax",
+        max_age=600,  # 10 minutes
+        path="/",
+    )
     return response
 
 
@@ -77,13 +138,20 @@ def auth_callback(request: Request):
 
     state = request.cookies.get("oauth_state")
     if not state:
-        raise HTTPException(status_code=400, detail="Missing OAuth state.")
+        raise HTTPException(status_code=400, detail="Missing OAuth state cookie.")
 
-    flow = build_flow(request)
-    flow.fetch_token(authorization_response=str(request.url))
+    flow = build_flow(request, state=state)
+
+    try:
+        flow.fetch_token(authorization_response=str(request.url))
+    except Exception as e:
+        logger.exception("OAuth token exchange failed")
+        raise HTTPException(
+            status_code=400,
+            detail=f"OAuth token exchange failed: {str(e)}"
+        ) from e
 
     creds = flow.credentials
-
     stored_token = {
         "token": creds.token,
         "refresh_token": creds.refresh_token,
@@ -93,10 +161,12 @@ def auth_callback(request: Request):
         "scopes": creds.scopes,
     }
 
-    return JSONResponse({
+    response = JSONResponse({
         "status": "authenticated",
         "message": "Google login complete. You can now call /read-current"
     })
+    response.delete_cookie(key="oauth_state", path="/")
+    return response
 
 
 @app.get("/read-current")
@@ -133,4 +203,5 @@ def read_current(folder_id: str = FOLDER_ID):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("read-current failed")
+        raise HTTPException(status_code=500, detail=str(e)) from e
